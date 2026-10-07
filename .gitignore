@@ -1,0 +1,9 @@
+# Git ignore file for the store-sales-lstm project
+__pycache__/
+*.pyc
+.venv311
+.vscode/
+
+/artifacts/
+/data/
+
