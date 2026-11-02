@@ -710,10 +710,318 @@ def apply_target_stats(
 # Categorial Vocabularies
 # ====================================
 
+def _normalize_category(
+    series: pd.Series,
+    ) -> pd.Series:
+    """
+    Normalizing a pandas series or categorical columns
+
+    Args:
+        series: pandas series to normalize
+
+    Returns:
+        Pandas series after normalizing
+    """
+
+    return (
+        series.astype("string").fillna("<MISSING>").astype(str)
+    )
+
+def fit_vocab(
+    series: pd.Series,
+    ) -> dict[str, int]:
+    """
+    Creating a vocabulary mapping for a categorical pandas series.
+
+    Args:
+        series: pandas series to create vocabulary for
+
+    Returns:
+        Dictionary mapping each unique category to a unique integer, starting from 1. 0 is reserved for UNKNOWN categories.
+    """
+
+    values = (
+        _normalize_category(series).drop_duplicates().sort_values().tolist()
+    )
+
+    # 0 is reserved for UNKNOWN categories.
+    return {
+        value: idx + 1 for idx, value in enumerate(values)
+    }
+
+def apply_vocab(
+    series: pd.Series,
+    vocab: dict[str,int],
+) -> pd.Series:
+    """
+    Applying a vocabulary mapping to a categorical pandas series.
+
+    Args:
+        series: pandas series to apply vocabulary to
+        vocab: Dictionary mapping each unique category to a unique integer
+
+    Returns:
+        Pandas series with categories replaced by their corresponding integer values. Unknown categories are mapped to 0.
+    """
+    
+    normalized = _normalize_category(series)
+    return normalized.map(vocab).fillna(0).astype("int64")
+
+def fit_vocabs(
+    df: pd.DataFrame,
+    cutoff: pd.Timestamp,
+) -> dict[str, dict[str, int]]:
+    """
+    Fitting vocabularies for all categorical columns in a DataFrame up to a given cutoff date.
+
+    Args:
+        df: pandas DataFrame containing the data
+        cutoff: Timestamp to filter the data up to
+
+    Returns:
+        Dictionary mapping each categorical column to its vocabulary dictionary
+    """
+
+    mask = (
+        df["date"] <= cutoff
+    )  
+
+    vocabs = {}
+    
+    for col in CAT_COLS:
+        vocabs[col] = fit_vocab(df.loc[mask, col])
+    return vocabs
+
+def apply_vocabs(
+    df: pd.DataFrame,
+    vocabs: dict[str, dict[str, int]],
+) -> pd.DataFrame:
+    """
+    Applying vocabularies to all categorical columns in a DataFrame.
+
+    Args:
+        df: pandas DataFrame containing the data
+        vocabs: Dictionary mapping each categorical column to its vocabulary dictionary
+
+    Returns:
+        DataFrame with categorical columns replaced by their corresponding integer values
+    """
+
+    df = df.copy()
+    for col, vocab in vocabs.items():
+        df[f"{col}_idx"] = apply_vocab(df[col], vocab)
+    return df
 
 
+# ================================================
+# Full Preprocessor
+# ================================================
 
+def fit_preprocessor(
+    panel: pd.DataFrame,
+    fit_cutoff: pd.Timestamp,
+) -> PreprocessorState:
+    """
+    Fitting the full preprocessor for the given DataFrame up to a specified cutoff date.
 
+    Args:
+        panel: pandas DataFrame containing the data
+        fit_cutoff: Timestamp to filter the data up to
+
+    Returns:
+        PreprocessorState containing the fitted vocabularies and any other preprocessing state
+    """
+    
+    numeric_stats = fit_numeric_stats(panel, fit_cutoff)
+    
+    (target_stats, global_target_loc, global_target_scale) = fit_target_stats(panel, fit_cutoff)
+
+    vocabs = fit_vocabs(panel, fit_cutoff)
+
+    return PreprocessorState(
+        numeric_stats=numeric_stats,
+        vocabs=vocabs,
+        target_stats=target_stats,
+        global_target_loc=global_target_loc,
+        global_target_scale=global_target_scale,
+        fit_cutoff=pd.Timestamp(fit_cutoff),
+    )
+
+def transform_panel(
+    panel: pd.DataFrame,
+    state: PreprocessorState,
+) -> pd.DataFrame:
+    """
+    Transforming the given panel DataFrame using the fitted preprocessor state.
+
+    Args:
+        panel: pandas DataFrame containing the data
+        state: PreprocessorState containing the fitted vocabularies and preprocessing state
+
+    Returns:
+        Transformed DataFrame with numeric columns standardized and categorical columns replaced by their corresponding integer values
+    """
+
+    df = apply_numeric_stats(panel, state.numeric_stats)
+    
+    df = apply_target_stats(
+        df, 
+        target_stats=state.target_stats, 
+        global_target_loc=state.global_target_loc, 
+        global_target_scale=state.global_target_scale
+    )
+   
+    df = apply_vocabs(df, state.vocabs)
+
+    return df
+
+def fit_transform_panel(
+    panel: pd.DataFrame,
+    fit_cutoff: pd.Timestamp,
+) -> Tuple[pd.DataFrame, PreprocessorState]:
+    """
+    Fit the preprocessor on the given panel DataFrame up to a specified cutoff date and transform the panel.
+
+    Args:
+        panel: pandas DataFrame containing the data
+        fit_cutoff: Timestamp to filter the data up to
+
+    Returns:
+        A tuple containing the transformed DataFrame and the fitted PreprocessorState
+    """
+    state = fit_preprocessor(
+        panel, 
+        fit_cutoff=fit_cutoff
+        )
+    transformed_panel = transform_panel(panel, state)
+
+    validate_model_frame(transformed_panel)
+
+    return transformed_panel, state
+
+# =============================
+# Validation
+# =============================
+
+def validate_model_frame(
+    df: pd.DataFrame,
+) -> None:
+    """
+    Validate the given DataFrame to ensure it contains all required columns and no missing values in critical features.
+
+    Args:
+        df: pandas DataFrame containing the data to validate
+
+    Raises:
+        ValueError: If any required columns are missing or if there are NaN values in critical features
+    """
+    required_columns = set(
+        HIST_FEATURES + FUTURE_FEATURES + STATIC_CAT_FEATURES
+        )
+    missing_columns = (required_columns - set(df.columns))
+    if missing_columns:
+        raise ValueError(
+            f"Missing required columns: {missing_columns}"
+            f"{sorted(missing_columns)}"
+            )
+    
+    # target_z is intentionally NaN in test rows
+    numeric_features = list(
+        set(
+            HIST_FEATURES + FUTURE_FEATURES) - {"target_z"}
+        )
+    
+    if (df[numeric_features].isna().any().any()):
+        bad = (df[numeric_features].isna().sum())
+        bad = bad[bad > 0]
+        raise ValueError(
+            f"NaN found in model features: {bad}"
+        )
+    observed_mask = (
+        df["sales_log"].notna()
+    )
+    
+    if (df.loc[observed_mask, "target_z",].isna().any()):
+        raise ValueError(
+            "Observed target rows contain NaN target_z."
+        )
+    if (
+        df[STATIC_CAT_FEATURES].isna().any().any()
+    ):
+        raise ValueError(
+            "Missing values found in static categorical features."
+        )
+
+# ===============================
+# Cardinalities Checks
+# ==============================
+def get_categorical_cardinalities(
+    state: PreprocessorState,
+) -> list[int]:
+    """
+    Get the cardinalities of the categorical features based on the preprocessor state.
+
+    Args:
+        state: PreprocessorState containing the vocabulary information for categorical features
+
+    Returns:
+        A list of integers representing the cardinalities of the categorical features
+    """
+    return [
+        len(state.vocabs[col]) + 1 for col in CAT_COLS
+    ]
+
+# =================================
+# Artifact persistence
+# =================================
+def save_preprocessor(
+    state: PreprocessorState,
+    path: Path,
+) -> None:
+    """
+    Save the preprocessor state to a file.
+
+    Args:
+        state: PreprocessorState to be saved
+        path: Path to the file where the state should be saved
+
+    Returns:
+        None
+    """
+    path = Path(path)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "wb") as f:
+        pickle.dump(state, f)
+
+def load_preprocessor(
+    path: Path,
+) -> PreprocessorState:
+    """
+    Load the preprocessor state from a file.
+
+    Args:
+        path: Path to the file containing the saved preprocessor state
+
+    Returns:
+        PreprocessorState object loaded from the file
+    """
+    path = Path(path)
+
+    with path.open("rb") as f:
+        state = pickle.load(f)
+    
+    if not isinstance(state, PreprocessorState):
+        raise ValueError(
+            f"Loaded artifact is not a PreprocessorState: {type(state)}"
+        )
+    
+    return state
+
+    
+
+   
 
 
 
